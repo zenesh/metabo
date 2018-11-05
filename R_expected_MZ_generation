@@ -1,0 +1,370 @@
+library(tidyverse)
+library(magrittr)
+library(glue)
+
+#read in database file #generated from HMDB database downloaded on 20180708.
+#HMDB.xml parsed by python script 'parse_hmdb_xml.py'
+db <- "hmdb_changed_lipid_charge_20180919.csv"
+
+#readr version
+database <- read_csv(db)
+
+####################################################################################################
+#general checking of elements in the database
+#get list of all the elements in the database
+
+chem_formulas <- database['chemical_formula']
+
+element_vect = character()
+for (i in 1:nrow(chem_formulas)){
+  chemical <- chem_formulas[i,][[1]]
+  chem_split <- str_split(chemical, "((?<=[a-zA-Z])(?=[A-Z])|(?<=\\d))(?=[A-Z])")[[1]]
+  
+  inner_vect = character()
+  for (j in seq_along(chem_split)){
+    element_unit <- chem_split[j]
+    element <- parse_chem_num_helper(element_unit)$chem
+    inner_vect[j] <- element
+  }
+  
+  for (k in seq_along(inner_vect)){
+    if (!(inner_vect[k] %in% element_vect))
+      element_vect <- c(element_vect, inner_vect[k])
+  }
+}
+
+#65 elements in total
+#[1] "C"  "H"  "N"  "O"  "I"  "S"  "P"  "Ca" "Cl" "Mg" "K"  "Na" "Cr" "Co" "Cu" "F"  "Fe" "Al" "Mo" "Rb" "Mn" "Se" "Zr" "Ga"
+#[25] "Te" "Br" "Sn" "Ti" "W"  "Si" "Bi" "As" "B"  "Be" "Ni" "Ge" "V"  "Ag" "Hg" "Cd" "Sr" "Sb" "Au" "Ba" "Ta" "Pb" "Li" "Y" 
+#[49] "Ru" "Cs" "Pd" "Pt" "Ce" "La" "Nd" "Re" "Tl" "Gd" "Zn" "Hf" "Th" "He" "Ar" "Nb" "Sm"
+#will filter out all except those with "C",  "H",  "N",  "O",  "P", "S", "F", "Cl", "Br", "I"
+
+#output filtered out hmdb entries
+db_exclude <-
+  database %>%
+  filter(str_detect(chemical_formula, '[^CHNOPSFI0-9]')) %>%
+  filter(!str_detect(chemical_formula, 'Cl|Br')) %>%
+  write.csv(file = "db_exclude_metals.csv", row.names = FALSE)
+
+#############################################################################################################################
+#generate reference elemental monoisotopic mass vector
+element_ref_mass_vect <- c(12, 1.007825, 14.003074, 15.994915, 30.973763, 31.972072, 18.998403, 34.968853, 78.918336, 126.904477)
+names(element_ref_mass_vect) <- c('C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I')
+
+##########################################################################################################
+#double check database molecular weight with chemical formula
+##########################################################################################################
+#parse chemical formula and generate calculated mass and mass difference
+db_element_filtered <-
+  database %>%
+  mutate(chemical_unit = chemical_formula) %>%
+  filter(!str_detect(chemical_formula, '[^ClHNOPSFIBr0-9]')) %>%    #2 step filtering permissive
+  separate_rows(chemical_unit, sep="((?<=[a-zA-Z])|(?<=\\d))(?=[A-Z])") %>%
+  separate(chemical_unit, c('element', 'num'), sep="(?<=[a-zA-Z])(?=\\d)", fill = 'right') %>%
+  mutate(num = replace_na(num, 1)) %>%
+  mutate(num = as.numeric(num)) %>%
+  mutate(chem_unit_sum = element_ref_mass_vect[.$element] * num) %>%
+  group_by(accession) %>%
+  mutate(calculated_weight = sum(chem_unit_sum)) %>%
+  summarise_all(first) %>%
+  select(-c(smiles, element, num, chem_unit_sum)) %>%
+  mutate (mass_diff = abs(monoisotopic_weight - calculated_weight)) %>%
+  arrange(desc(mass_diff)) %>%
+  drop_na()                                                        #removes boron and Sr which was not filtered out earlier.
+
+#no mass difference except for 1 
+#6a-Hydrox-ypaclitaxel, HMDB0060794, mass diff of 6.020124995
+
+##########################################################################################################
+#generate aqueous databases
+##########################################################################################################
+db_aqueous <-
+  db_element_filtered %>%
+  filter(!str_detect(name, "\\(.*?:.*?\\)(\\[rac\\])?$|yl-CoA"))
+
+db_aqueous_pos <-
+  db_aqueous %>%
+  mutate(mz = case_when(charge == -2L ~ monoisotopic_weight + element_ref_mass_vect["H"] * 3,
+                        charge == -1L ~ monoisotopic_weight + element_ref_mass_vect["H"] * 2,
+                        charge == 0L ~ monoisotopic_weight + element_ref_mass_vect["H"],
+                        charge == 1L ~ monoisotopic_weight,
+                        charge == 2L ~ monoisotopic_weight/2,
+                        charge == 3L ~ monoisotopic_weight/3)
+                        ) %>%
+  select(mz, name, accession, monoisotopic_weight, chemical_formula, charge) %>%
+  write.csv(file = "db_v4_aqueous_pos_20180924.csv", row.names = FALSE)
+
+db_aqueous_neg <-
+    db_aqueous %>%
+    mutate(mz = case_when(charge == -2L ~ monoisotopic_weight/2,
+                          charge == -1L ~ monoisotopic_weight,
+                          charge == 0L ~ monoisotopic_weight - element_ref_mass_vect["H"],
+                          charge == 1L ~ monoisotopic_weight - element_ref_mass_vect["H"] * 2,
+                          charge == 2L ~ monoisotopic_weight - element_ref_mass_vect["H"] * 3,
+                          charge == 3L ~ monoisotopic_weight - element_ref_mass_vect["H"] * 4)
+                          ) %>%
+  select(mz, name, accession, monoisotopic_weight, chemical_formula, charge) %>%
+  write.csv(file = "db_v4_aqueous_neg_20180924.csv", row.names = FALSE)
+##########################################################################################################
+
+##########################################################################################################
+#working on lipids in databases
+##########################################################################################################
+
+#get all lipids. (83481 entries) (20180920, 83800 entries after adding the CoA)
+db_lipid <- filter(db_element_filtered, str_detect(name, "\\(.*?:.*?\\)(\\[rac\\])?$|yl-CoA"))
+
+#some errors. some lipids the double bond is placed wrongly (eg. Galabiosylceramide (d18:1/9z-18:1) HMDB0004832)
+#change to Galabiosylceramide (d18:1/18:1(9z))
+#rename location of double bond in lipid names
+db_lipid<-  
+  db_lipid %>%
+  mutate(name = str_replace(name, "(?<=/)([1-9]+Z)-(\\d+:\\d+)", "\\2\\(\\1\\)"))
+
+#get all lipid with overal charge (11 in total) (20180919: no more. edited away)
+db_lipid_charged <- 
+  db_lipid %>%
+  filter(!charge == 0)
+
+#remove single H+ from db_lipid_charged to return them to neutral
+#smiles structure not changed. manually edit the csv file. monoisotopic mass will be deducted by 1.0078
+#csv file renamed to hmdb_changed_lipid_charge_20180919.csv
+#############################################################################################################
+#string filter for typical lipids
+lipid_detect_part <- c("PC\\(", "PE\\(", "PI\\(", "PG\\(", "PS\\(",
+                       "Cer\\(", "SM\\(", "MG\\(", "TG\\(", "CL\\(", "DG\\(")
+
+
+#####  function to condense the name of lipid chains to something that is MS relevant ########################
+#####  aim is to remove naming conventions that are isomeric ################################################
+
+condensed_lipid <- function(lipid){
+  #condense lipid name to 'lipid_head'['prefix'fatty acid chain length]:[number of double bonds'suffix']
+  lipid_head <- str_extract(lipid, "^.+?(?=\\()")
+  
+  prefix <- 
+    str_match_all(lipid, "([A-Za-z]*)-?\\d*:")[[1]][,2] %>%
+    `[` (.!="") %>%
+    unique() %>%
+    sort() %>%
+    if(is_empty(.)) . else paste0(paste0(., collapse = ""), "-")
+  
+  chain_length <- 
+    str_match_all(lipid, "(\\d*):")[[1]][,2] %>%
+    as.numeric() %>%
+    sum()
+  
+  double_bond <- 
+    str_match_all(lipid, ":(\\d*)")[[1]][,2] %>%
+    as.numeric() %>%
+    sum()
+  
+  suffix <- 
+    str_match_all(lipid, ":\\d*-?([a-mo-zA-Z])")[[1]][,2] %>%
+    `[` (.!="") %>%
+    unique() %>%
+    sort() %>%
+    if(is_empty(.)) . else paste0(., collapse = "")
+  
+    lipid_name <- paste0(lipid_head,"(", prefix, chain_length,":", double_bond,suffix, ")")
+  return(lipid_name)
+} 
+
+#difficulties in creating a function that can condesnse all lipids in the database.
+#create different functions to apply to different classes of lipids.
+####################################################################################################
+
+condensed_ring_lipid <- function(lipid){
+  #condense lipids with D or M ring structures (Dimethyl furan or methyl furan)
+  #split off the CE ring lipids
+  
+  if (str_detect(lipid, '^CE')){
+    lipid_name <- condesed_ringCE_lipid(lipid)
+    return(lipid_name)
+    }
+  
+  lipid_idx <- str_locate(lipid, "^.+?(?=\\()")
+  lipid_head <- str_sub(lipid, start = 1L, end = lipid_idx[1,'end'])
+  lipid_chain <- str_sub(lipid, start = lipid_idx[1,'end']+2, end = -2L)
+  
+  lipid_units <- unlist(str_split(lipid_chain, '/')) %>%
+    `[` (.!="0:0") %>%
+  sort()
+  
+  lipid_name <- paste0(lipid_head,'(', paste0(lipid_units, collapse='/'), ')')
+  return(lipid_name)                        
+}
+
+#####################################################################################################
+condesed_ringCE_lipid<- function(lipid){
+  lipid_head <- 'CE'
+  lipid_chain <- str_sub(lipid, start = 4, end = -2L)
+  ring_ext_carb <- str_extract(lipid_chain, '[DM][0-9]+')
+  lipid_unit <- str_replace(lipid_chain, '[DM][0-9]+', "")
+  
+  lipid_name <- paste0(lipid_head,'(', lipid_unit, ring_ext_carb, ')' )
+  return(lipid_name)        
+}
+                           
+#####################################################################################################
+condensed_branched_FA_ester<- function(lipid){
+  lipid <- str_replace(lipid, '[1-9]+-O-', "")
+  
+  lipid_head <- str_extract(lipid, "^.+?(?=\\()")
+  
+  prefix <- 
+    str_match_all(lipid, "([a-zA-Z]*)-?\\d*:")[[1]][,2] %>%
+    'c' (., "O") %>%
+    `[` (.!="") %>%
+    unique() %>%
+    sort() %>%
+    if(is_empty(.)) . else paste0(paste0(., collapse = ""), "-")
+  
+  chain_length <- 
+    str_match_all(lipid, "(\\d*):")[[1]][,2] %>%
+    as.numeric() %>%
+    sum()
+  
+  double_bond <- 
+    str_match_all(lipid, ":(\\d*)")[[1]][,2] %>%
+    as.numeric() %>%
+    sum()
+  
+  suffix <- 
+    str_match_all(lipid, ":\\d*-?([a-mo-zA-Z])")[[1]][,2] %>%
+    `[` (.!="") %>%
+    unique() %>%
+    sort() %>%
+    if(is_empty(.)) . else paste0(., collapse = "")
+  
+  lipid_name <- paste0(lipid_head,"(", prefix, chain_length,":", double_bond,suffix, ")")
+  
+  return(lipid_name)
+}             
+
+############################################################################################
+#generate condensed name based on multiple classes
+############################################################################################
+db_lipid_norm <-
+  db_lipid %>%
+  mutate(condensed = case_when(str_detect(name, 'yl-CoA') ~ name,
+                               str_detect(name, '[1-9][DM][1-9]') ~ map_chr(name, condensed_ring_lipid),
+                               str_detect(name, '[1-9]-O-[1-9]') ~ map_chr(name, condensed_branched_FA_ester),
+                               TRUE                      ~  map_chr(name, condensed_lipid)))
+    
+#group and output lipids with same condensed name but different mass.
+db_lipid_shared_mass <-
+  db_lipid_norm %>%
+  mutate(round_mass = signif(monoisotopic_weight, digits = 8)) %>%      #database introduces slight mass differences (6 decimal place) to differentiate entries
+  group_by(condensed) %>%
+  mutate(num_identical_mass = n_distinct(round_mass)) %>%
+  filter(num_identical_mass > 1) %>%
+  select(accession, monoisotopic_weight, condensed, name, everything ()) %>%
+  ungroup %>%
+  distinct(condensed, round_mass, .keep_all = TRUE)
+
+#seems like there are condenseded names with different masses. refer to section below for output of db with problem entries
+#144 entries altogehter about 70 pairs to work through. 
+#typically the name is wrong. 
+#calculated mass from formula is similar to database.
+write.csv(db_lipid_shared_mass, file = "lipid_check_mass_formula_name.csv", row.names = FALSE)
+
+#######################################################################################################################
+##### group isomeric lipids. First database entry of the group is elected to represent the group. #####################
+#######################################################################################################################
+
+#select the first entry to represent the group. !!!!might have wrong mass as the first is selected to represent the group
+#add counts (n). Count number of lipid with the same condensed formula
+#get reduced group of entries. First one is selected
+
+db_grouped <- db_lipid_norm %>%
+  group_by(condensed) %>%  #all these lipids should have the same mass
+  add_count() %>%
+  do(head(., 1)) %>%    #select first entry of each 'condensed' group to represent the group. (eg name and hmdb number)
+  rename(number_of_same_cond_name = n,
+         mass = monoisotopic_weight,
+         hmdb = accession) %>%
+  select(mass,name, hmdb, condensed, number_of_same_cond_name)
+
+########################################################################################
+#vector with names of all adducts
+adduct_ref <- c(1.0078, 15.0234, 18.0105, 18.0343, 22.9898, 38.9637)
+names(adduct_ref) <- c("H", "CH3", "H2O", "NH4", "Na", "K")
+
+##### function to add adducts to database   #########################################
+#adduct: adduct string to add can a combo adducts (eg, +H, -H, +Na-2H, -2H/2)
+#adduct_ref which adduct vector to get the masses from. 
+#will be parsed with + or - to add or remove
+#number in front of adduct will mean multiples of the adduct
+#helper function to parse each individual adduct
+
+##### parse individual adduct ############################################################
+parse_adduct <- function(adduct, adduct_ref)   {      #parse individual adducts
+  
+  parsed <- str_match_all(adduct, "([\\+|\\-])(\\d*)(\\w+)")[[1]]
+  parsed_mass <- vector("numeric")
+  
+  for (row in 1:nrow(parsed)) {                   #mulitple additions or subtractions
+    if (is.na(as.integer(parsed[row,3]))) {     #number. default to 1 if no value
+      add_mul <- 1
+    } else {
+      add_mul <- as.integer(parsed[row,3])}
+    
+    mass <- adduct_ref[parsed[row,4]]                  #mass. 
+    parsed_mass[row] <- do.call(parsed[row,2], list( add_mul * mass)) #expression to sum, sign can flip from + to -
+  }
+  parsed_mass <- sum(parsed_mass)
+  names(parsed_mass) <- (adduct)
+  return(parsed_mass)  
+}
+##### parse adducts for lipid class ######################################################
+#better to sepearta the lipid class parsing portion of this function.
+#lipid_class regex code to get the relevent database entries.
+#database is source of database in a dataframe object
+#adduct_ref which adduct vector to get the masses from.
+#adduct: adduct string to add can be combo adducts (eg, +H, -H, +Na-2H, -2H/2)
+#... any other adducts. (eg. PC or SM: "+H", "+Na", "+K") this will add additional entries to each condensed PC or SM lipid
+#/x will divide the M+adduct/x (eg. CL: "-2H/2") this will do (M-2)/2
+#output a dataframe with same columns as input. additional 'adduct' and 'condensed_adduct' column added
+
+add_adduct <- function(lipid_class, database, adduct_ref, adduct, ...) {
+  
+  #get relevant portions of database
+  db_process <- database %>% 
+  filter(str_detect(condensed, lipid_class))  #"PC\\(|SM\\(" filters for PC and SM lipids in database
+  
+  #parse adduct list  
+  adducts <- unlist(strsplit((c(adduct,...))," "))
+
+  #list of addition adduct_db constructed
+  adduct_db <- vector("list")
+  
+  for (adduct_idx in 1:length(adducts)) {
+    
+    parse_charge = as.integer(str_extract(adducts[adduct_idx], "(?<=/)(\\d*$)"))
+
+    parsed_mass <- parse_adduct(adducts[adduct_idx], adduct_ref)
+    print(glue("Adding {names(parsed_mass)} of mass {parsed_mass} 
+                 to each {lipid_class} entry"))
+    
+    if (!is.na(parse_charge)){
+      adduct_db_processed <-
+        db_process %>%
+        mutate(mass = (mass + parsed_mass) / parse_charge, 
+               condensed_adduct = paste0(condensed, 
+              names(parsed_mass)), 
+              adduct = names(parsed_mass))   
+    } else {
+    adduct_db_processed <-
+      db_process %>%
+      mutate(mass = mass + parsed_mass, 
+             condensed_adduct = paste0(condensed, names(parsed_mass)), 
+             adduct = names(parsed_mass)) 
+    }
+    adduct_db[[adduct_idx]] <- adduct_db_processed    
+  }
+  
+  out_db <- bind_rows(adduct_db)
+  return(out_db)
+}
+

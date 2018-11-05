@@ -1,0 +1,117 @@
+# -*- coding: utf-8 -*-
+"""
+adapted and inspired from
+https://yufree.cn/en/2018/04/11/play-with-hmdb-datasets/
+
+Created on Mon Aug 27 15:09:37 2018
+
+@author: Daniel Ng
+"""
+#had some trouble with encoding. therefore the sprinking of 'encoding="utf-8"'
+#and '.decode()' tags
+
+
+
+from lxml import etree
+import os
+import pandas as pd
+import re
+
+xml = 'hmdb_metabolites.xml'
+ns = {'hmdb': 'http://www.hmdb.ca'}
+
+#initialize list to store metabolite data as tuples
+metabolites_list = []
+
+context = etree.iterparse(xml, tag='{http://www.hmdb.ca}metabolite')
+for event, elem in context:
+
+    accession = elem.xpath('hmdb:accession/text()', namespaces = ns)[0]
+    try:
+        monisotopic_molecular_weight = elem.xpath('hmdb:monisotopic_molecular_weight/text()', namespaces = ns)[0]
+    except:
+        monisotopic_molecular_weight = 'NA'
+   
+    name = elem.xpath('hmdb:name/text()', namespaces = ns)[0]
+    try:
+        chemical_formula = elem.xpath('hmdb:chemical_formula/text()', namespaces = ns)[0]
+    except:
+        chemical_formula = 'NA'
+    try:
+        smiles = elem.xpath('hmdb:smiles/text()', namespaces = ns)[0]
+    except:
+        smiles = 'NA'
+    
+    #there are still other fields in the HMDB file. add as required.
+    #see https://yufree.cn/en/2018/04/11/play-with-hmdb-datasets/ for more fields to add.
+    
+    
+    #metabolite data stored as tuples in list (monoisotopic weight, name, chemical_formula, smiles)
+    metabolite = monisotopic_molecular_weight, name, accession, chemical_formula, smiles
+    metabolites_list.append(metabolite)    
+    
+    # It's safe to call clear() here because no descendants will be
+    # accessed
+    elem.clear()
+# Also eliminate now-empty references from the root node to elem
+    for ancestor in elem.xpath('ancestor-or-self::*'):
+        while ancestor.getprevious() is not None:
+            del ancestor.getparent()[0]
+del context
+
+#create metabolites dataframe
+metabolites_df = pd.DataFrame.from_records(metabolites_list, columns= ['monoisotopic_weight', \
+                                                                       'name', \
+                                                                       'accession', \
+                                                                       'chemical_formula', \
+                                                                       'smiles'])
+#clean up. Remove monoisotopic_weight = NA
+#certain polymeric metabolite entries have no defined monoisotopic_weight
+metabolites_df =  metabolites_df[metabolites_df['monoisotopic_weight'] != 'NA']
+
+#change weight to float type
+metabolites_df['monoisotopic_weight'] = pd.to_numeric(metabolites_df['monoisotopic_weight'])
+
+#get all charged metabolites
+charged_df = metabolites_df[metabolites_df['smiles'].str.contains('\+|-')]
+
+##### functions to get charge from smiles #####################################
+def decipher_charges(x):
+    if len(x) >1:
+        return int(x[1:])
+    else:
+        return 1
+def get_overall_charge(smiles_str):
+    charge_list = re.findall('([\+|-]\\d*)', smiles_str)
+    charge_counter = 0
+    for x in charge_list:
+        if x.startswith('+'):
+            charge_counter += decipher_charges(x)
+        elif x.startswith('-'):
+            charge_counter += -(decipher_charges(x))
+    return charge_counter
+   
+##############################################################################
+#add charge column to the dataframe
+metabolites_df['charge'] = metabolites_df['smiles'].apply(get_overall_charge)
+
+#remove smiles column
+metabolites_df = metabolites_df.drop(columns=['smiles'])
+
+
+#fieldnames = ['monisotopic_molecular_weight',  
+#              'name', 
+#              'accession',
+#              'chemical_formula',
+#              'smiles',
+#              'charge']
+
+outfile = 'hmdb_with_charge.csv'
+
+metabolites_df.to_csv(outfile, index=False)
+
+
+
+
+
+
